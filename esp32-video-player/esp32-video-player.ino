@@ -22,6 +22,7 @@
 #include "DisplayConfig.h"
 #include "SDConfig.h"
 #include "PicoJpegClass.h"
+#include "AudioMP3.h"
 
 extern "C" {
   #include "picojpeg.h"
@@ -37,6 +38,9 @@ static TaskHandle_t displayTaskHandle = NULL;
 static QueueHandle_t frameQueue = NULL;
 static SemaphoreHandle_t frameReadySem = NULL;
 static SemaphoreHandle_t frameDisplaySem = NULL;
+
+// Audio
+static AudioMP3 audioPlayer;
 
 // Frame buffers (double-buffering)
 #ifdef BOARD_HAS_PSRAM
@@ -66,8 +70,11 @@ static float currentFPS = 0.0f;
 
 // File handling
 static File mjpegFile;
+static File audioFile;
 static char currentFilename[128];
+static char audioFilename[128];
 static bool fileOpen = false;
+static bool hasAudio = false;
 
 // Button
 #define BOOT_BUTTON_PIN 0
@@ -377,6 +384,24 @@ void loadFileList() {
   Serial.printf("Found %d video files\n", mjpegCount);
 }
 
+// Check if corresponding audio file exists
+bool checkAudioFile(const char* videoFilename) {
+  // Create audio filename from video filename
+  // e.g., video.mjpeg -> video.mp3
+  String videoPath = String(videoFilename);
+  int dotPos = videoPath.lastIndexOf('.');
+  if (dotPos > 0) {
+    String audioPath = videoPath.substring(0, dotPos) + ".mp3";
+    audioPath = String(MJPEG_FOLDER) + "/" + audioPath;
+    
+    if (SD.exists(audioPath.c_str())) {
+      audioPath.toCharArray(audioFilename, sizeof(audioFilename));
+      return true;
+    }
+  }
+  return false;
+}
+
 bool openNextFile() {
   if (mjpegCount == 0) return false;
   
@@ -385,6 +410,10 @@ bool openNextFile() {
     mjpegFile.close();
     fileOpen = false;
   }
+  
+  // Stop any playing audio
+  audioPlayer.stop();
+  hasAudio = false;
   
   String fullPath = String(MJPEG_FOLDER) + "/" + mjpegFiles[currentFileIndex];
   fullPath.toCharArray(currentFilename, sizeof(currentFilename));
@@ -398,6 +427,14 @@ bool openNextFile() {
   }
   
   fileOpen = true;
+  
+  // Check for matching audio file
+  hasAudio = checkAudioFile(mjpegFiles[currentFileIndex].c_str());
+  if (hasAudio) {
+    Serial.printf("Audio found: %s\n", audioFilename);
+    audioPlayer.openFile(audioFilename);
+  }
+  
   return true;
 }
 
@@ -422,12 +459,17 @@ void decoderTask(void* parameter) {
   uint32_t bufferOffset = 0;
   bool findingFrame = true;
   uint32_t jpegSize = 0;
+  bool audioStarted = false;
   
   while (true) {
     // Check for skip request
     if (skipRequested) {
       skipRequested = false;
       Serial.println("Skip requested");
+      
+      // Stop audio
+      audioPlayer.stop();
+      audioStarted = false;
       
       // Move to next file
       currentFileIndex++;
@@ -452,6 +494,13 @@ void decoderTask(void* parameter) {
       bufferOffset = 0;
       findingFrame = true;
       jpegSize = 0;
+      audioStarted = false;
+    }
+    
+    // Start audio playback when video starts (after first frame decoded)
+    if (hasAudio && !audioStarted && totalFramesDecoded > 0) {
+      audioPlayer.play();
+      audioStarted = true;
     }
     
     // Read data from file
@@ -470,6 +519,9 @@ void decoderTask(void* parameter) {
       }
     } else {
       // End of file
+      audioPlayer.stop();
+      audioStarted = false;
+      
       if (mjpegFile) {
         mjpegFile.close();
         fileOpen = false;
@@ -621,6 +673,10 @@ void setup() {
     while (1) delay(100);
   }
   Serial.println("SD card initialized");
+  
+  // Initialize audio DAC on GPIO 25
+  audioPlayer.begin();
+  Serial.println("Audio system initialized");
   
   // Load file list
   loadFileList();
