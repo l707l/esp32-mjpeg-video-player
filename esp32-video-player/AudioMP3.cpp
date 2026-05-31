@@ -1,23 +1,23 @@
 /*******************************************************************************
  * Audio MP3 Decoder Implementation for ESP32-2432S028
  * 
- * Lightweight MP3 decoder using internal DAC on GPIO 25
- * Optimized for minimal CPU impact during video playback
+ * Uses internal DAC on GPIO 25 + PAM8403 amplifier
+ * Libhelix MP3 decoder for minimal CPU impact
  ******************************************************************************/
 
 #include "AudioMP3.h"
-#include "driver/dac.h"
+#include "libhelix/MP3DecoderHelix.h"
 
-// MP3 constants
-#define MP3_SYNC_WORD       0xFFE
-#define MP3_HEADER_SIZE     4
+// MP3 Decoder instance
+static MP3DecoderHelix* s_mp3Decoder = nullptr;
+static AudioMP3* s_audioInstance = nullptr;
 
-// MPEG Audio Layer III bitrates (indexed by bith rate index)
-static const int mpegBitrates[16] = {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0};
-static const int mpegSampleRates[4] = {44100, 48000, 32000, 0};
-
-// Scale factor for fixed-point processing
-#define FIXED_SCALE  32768
+// Callback when MP3 frame is decoded
+static void mp3DataCallback(MP3FrameInfo& info, short* pcm_buffer, size_t pcmSamples, void* ref) {
+    if (s_audioInstance && pcmSamples > 0) {
+        s_audioInstance->writePCM(pcm_buffer, pcmSamples);
+    }
+}
 
 AudioMP3::AudioMP3() 
     : m_i2sPort(I2S_NUM_0)
@@ -42,12 +42,12 @@ AudioMP3::~AudioMP3() {
 }
 
 bool AudioMP3::begin() {
-    Serial.println("Initializing audio DAC...");
+    Serial.println("Initializing audio with libhelix MP3 decoder...");
     
     // Enable internal DAC on GPIO 25
     dac_output_enable(DAC_CHANNEL_1);
     
-    // Configure I2S for internal DAC
+    // Configure I2S for internal DAC (built-in DAC mode)
     i2s_config_t i2sConfig = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN),
         .sample_rate = AUDIO_SAMPLE_RATE,
@@ -63,14 +63,10 @@ bool AudioMP3::begin() {
     };
     
     i2s_driver_install(m_i2sPort, &i2sConfig, 0, NULL);
-    
-    // Configure I2S to use internal DAC (channel 1 = GPIO 25)
     i2s_set_dac_mode(I2S_DAC_CHANNEL_BOTH_EN);
-    
-    // Set sample rate
     i2s_set_sample_rates(m_i2sPort, AUDIO_SAMPLE_RATE);
     
-    Serial.println("Audio DAC initialized on GPIO 25");
+    Serial.println("Audio DAC initialized on GPIO 25 (I2S -> Built-in DAC)");
     
     return true;
 }
@@ -78,12 +74,17 @@ bool AudioMP3::begin() {
 void AudioMP3::end() {
     stop();
     
-    if (m_i2sPort) {
-        i2s_stop(m_i2sPort);
-        i2s_driver_uninstall(m_i2sPort);
-    }
+    if (m_i2sPort != I2S_NUM_0) return;
+    i2s_stop(m_i2sPort);
+    i2s_driver_uninstall(m_i2sPort);
     
     dac_output_disable(DAC_CHANNEL_1);
+    
+    if (s_mp3Decoder) {
+        delete s_mp3Decoder;
+        s_mp3Decoder = nullptr;
+    }
+    
     m_status = AUDIO_STATUS_IDLE;
 }
 
@@ -110,6 +111,10 @@ void AudioMP3::closeFile() {
         m_audioFile.close();
     }
     
+    if (s_mp3Decoder) {
+        s_mp3Decoder->end();
+    }
+    
     m_status = AUDIO_STATUS_IDLE;
 }
 
@@ -122,18 +127,28 @@ void AudioMP3::play() {
     m_pcmBufferPos = 0;
     m_pcmBufferUsed = 0;
     
+    // Create MP3 decoder with callback
+    if (!s_mp3Decoder) {
+        s_mp3Decoder = new MP3DecoderHelix(mp3DataCallback);
+        s_mp3Decoder->setMaxFrameSize(1600);  // ~128kbps max frame
+        s_mp3Decoder->setMaxPCMSize(8192);
+        s_mp3Decoder->begin();
+    }
+    
+    s_audioInstance = this;
+    
     // Create audio task on Core 1 with lower priority than display
     xTaskCreatePinnedToCore(
         [](void* param) { ((AudioMP3*)param)->audioTaskImpl(); },
         "Audio",
-        4096,
+        8192,  // More stack for MP3 decoding
         this,
         1,  // Lower priority than display
         &m_audioTaskHandle,
         1   // Core 1
     );
     
-    Serial.println("Audio playback started");
+    Serial.println("Audio playback started (libhelix MP3)");
 }
 
 void AudioMP3::stop() {
@@ -163,65 +178,36 @@ void AudioMP3::syncStart(uint32_t videoStartTime) {
     m_syncOffset = 0;
 }
 
-// Simple MP3 frame sync finder
-int AudioMP3::findFrameSync(const uint8_t* buffer, int size, int* outFrameSize) {
-    for (int i = 0; i < size - 4; i++) {
-        // Look for frame sync (0xFF 0xFB, 0xFF 0xF3, 0xFF 0xF2, etc.)
-        if ((buffer[i] == 0xFF) && (buffer[i + 1] & 0xE0) == 0xE0) {
-            // Found sync
-            int version = (buffer[i + 1] >> 3) & 0x03;
-            int layer = (buffer[i + 1] >> 1) & 0x03;
-            int bitrateIdx = (buffer[i + 2] >> 4) & 0x0F;
-            int samplerateIdx = (buffer[i + 2] >> 2) & 0x03;
-            int channels = ((buffer[i + 3] >> 6) & 0x03) == 3 ? 1 : 2;
-            
-            if (mpegBitrates[bitrateIdx] > 0 && mpegSampleRates[samplerateIdx] > 0) {
-                int bitrate = mpegBitrates[bitrateIdx] * 1000;
-                int samplerate = mpegSampleRates[samplerateIdx];
-                
-                // Calculate frame size
-                int frameSize = (144 * bitrate / samplerate) + (version == 3 ? 0 : 1);
-                
-                if (layer == 1) frameSize = frameSize * 4;
-                
-                *outFrameSize = frameSize;
-                return i;
-            }
-        }
-    }
-    return -1;
-}
-
-// Parse MP3 header to get format info
-bool AudioMP3::parseMP3Header(const uint8_t* header, int* bitrate, int* samplerate, int* channels) {
-    if ((header[0] != 0xFF) || ((header[1] & 0xE0) != 0xE0)) {
-        return false;
-    }
-    
-    int version = (header[1] >> 3) & 0x03;
-    int layer = (header[1] >> 1) & 0x03;
-    int bitrateIdx = (header[2] >> 4) & 0x0F;
-    int samplerateIdx = (header[2] >> 2) & 0x03;
-    int channelMode = (header[3] >> 6) & 0x03;
-    
-    if (mpegBitrates[bitrateIdx] == 0 || mpegSampleRates[samplerateIdx] == 0) {
-        return false;
-    }
-    
-    *bitrate = mpegBitrates[bitrateIdx] * 1000;
-    *samplerate = mpegSampleRates[samplerateIdx];
-    *channels = (channelMode == 3) ? 1 : 2;
-    
-    return true;
+void AudioMP3::writePCM(short* pcmSamples, size_t count) {
+    // Output PCM samples to I2S/DAC
+    size_t bytesWritten = 0;
+    i2s_write(m_i2sPort, pcmSamples, count * sizeof(short), &bytesWritten, portMAX_DELAY);
 }
 
 void AudioMP3::audioTaskImpl() {
-    Serial.println("Audio task running on Core 1");
+    Serial.println("Audio task started (libhelix decoder)");
     
-    uint8_t readBuffer[4096];
-    int bufferOffset = 0;
-    int frameSize = 0;
-    bool headerFound = false;
+    uint8_t mp3Chunk[2048];
+    int id3SkipCount = 0;
+    bool firstFrame = true;
+    
+    // Skip possible ID3v2 header at start
+    if (m_audioFile.available() >= 10) {
+        uint8_t header[10];
+        m_audioFile.read(header, 10);
+        // ID3v2 tag: "ID3" = 0x49 0x44 0x33
+        if (!(header[0] == 'I' && header[1] == 'D' && header[2] == '3')) {
+            // Not ID3, seek back
+            m_audioFile.seek(m_audioFile.position() - 10);
+        } else {
+            // ID3v2, skip rest of header and data
+            uint32_t tagSize = ((header[6] & 0x7F) << 21) | ((header[7] & 0x7F) << 14) 
+                             | ((header[8] & 0x7F) << 7) | (header[9] & 0x7F);
+            tagSize += 10; // include header
+            Serial.printf("Skipping ID3v2 tag: %u bytes\n", tagSize);
+            m_audioFile.seek(tagSize);
+        }
+    }
     
     while (m_playing) {
         if (m_paused) {
@@ -229,69 +215,36 @@ void AudioMP3::audioTaskImpl() {
             continue;
         }
         
-        // Read data from file if needed
-        if (bufferOffset < 1024 && m_audioFile.available()) {
-            size_t bytesRead = m_audioFile.read(readBuffer + bufferOffset, sizeof(readBuffer) - bufferOffset);
-            if (bytesRead > 0) {
-                bufferOffset += bytesRead;
+        // Read MP3 data from SD
+        if (m_audioFile.available() > 0) {
+            int toRead = min((int)sizeof(mp3Chunk), m_audioFile.available());
+            int bytesRead = m_audioFile.read(mp3Chunk, toRead);
+            
+            if (bytesRead > 0 && s_mp3Decoder) {
+                // Write to MP3 decoder (libhelix handles frame sync, decode, callback)
+                s_mp3Decoder->write(mp3Chunk, bytesRead);
+                
+                if (firstFrame) {
+                    MP3FrameInfo info = s_mp3Decoder->audioInfo();
+                    if (info.bitrate > 0) {
+                        Serial.printf("MP3: %d bps, %d Hz, ch=%d\n", 
+                            info.bitrate, info.samprate, info.nChans);
+                        firstFrame = false;
+                    }
+                }
             }
-        }
-        
-        if (bufferOffset < 4) {
-            // End of file or error
+        } else {
+            // End of file
             break;
         }
         
-        // Find frame sync
-        int frameStart = findFrameSync(readBuffer, bufferOffset, &frameSize);
-        
-        if (frameStart >= 0 && frameSize > 0 && frameSize < 4096) {
-            // Parse header if new
-            if (!headerFound) {
-                parseMP3Header(readBuffer + frameStart, &m_bitrate, &m_sampleRate, &m_channels);
-                Serial.printf("MP3: %d bps, %d Hz, %s\n", m_bitrate, m_sampleRate, m_channels == 1 ? "mono" : "stereo");
-                headerFound = true;
-            }
-            
-            // Decode the frame (simplified - for a real decoder we'd use libmad or minimp3)
-            // For this implementation, we'll output silence for now since full MP3 decode is complex
-            // The I2S DAC will produce audio from whatever samples we feed it
-            
-            // Copy frame for decode
-            uint8_t frameData[frameSize];
-            memcpy(frameData, readBuffer + frameStart, frameSize);
-            
-            // Shift buffer
-            if (frameStart + frameSize < bufferOffset) {
-                memmove(readBuffer, readBuffer + frameStart + frameSize, bufferOffset - frameStart - frameSize);
-                bufferOffset -= frameStart + frameSize;
-            } else {
-                bufferOffset = 0;
-            }
-            
-            // Feed samples to I2S/DAC - generate a simple sine wave for testing
-            // In a real implementation, you would decode the MP3 frame here
-            int16_t samples[512];
-            for (int i = 0; i < 256; i++) {
-                // Simple test tone (440 Hz)
-                int16_t sample = (int16_t)(sinf((float)i * 0.142) * 16000);
-                samples[i * 2] = sample;     // Left
-                samples[i * 2 + 1] = sample; // Right
-            }
-            
-            // Output to I2S (which goes to internal DAC)
-            size_t bytesWritten = 0;
-            i2s_write((i2s_port_t)m_i2sPort, samples, sizeof(samples), &bytesWritten, portMAX_DELAY);
-        } else {
-            // No sync found, shift buffer
-            if (bufferOffset > 0) {
-                memmove(readBuffer, readBuffer + 1, bufferOffset - 1);
-                bufferOffset--;
-            }
-        }
-        
-        // Small delay to prevent starving video decode
+        // Small yield to prevent starving video
         vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    
+    // Flush any remaining decoded audio
+    if (s_mp3Decoder) {
+        s_mp3Decoder->flush();
     }
     
     Serial.println("Audio task ended");
@@ -300,27 +253,16 @@ void AudioMP3::audioTaskImpl() {
     vTaskDelete(NULL);
 }
 
-void AudioMP3::outputSamples(int16_t* samples, int count) {
-    size_t bytesWritten = 0;
-    i2s_write(m_i2sPort, samples, count * sizeof(int16_t), &bytesWritten, 0);
-}
-
-// Placeholder implementations for MP3 decoding
+// Placeholder - not used with libhelix callback approach
 int AudioMP3::decodeMP3Frame() {
-    // This would need a proper MP3 decoder implementation
-    // For now, return 0 to indicate no samples decoded
     return 0;
 }
 
 void AudioMP3::imdct(float* input, float* output, int n) {
-    // Placeholder - would implement IMDCT for full MP3 decode
-    for (int i = 0; i < n; i++) {
-        output[i] = input[i];
-    }
+    for (int i = 0; i < n; i++) output[i] = input[i];
 }
 
 int AudioMP3::huffmanDecode(int16_t* output, const uint8_t* input, int bitsLeft, 
                             const uint8_t* table, int tableSize) {
-    // Placeholder - would implement Huffman decoding
     return 0;
 }
