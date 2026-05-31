@@ -1,43 +1,26 @@
-/**
- * SD Card Configuration - ESP32 MJPEG Video Player
+/*******************************************************************************
+ * SD Card Configuration for ESP32-2432S028 (CYD)
  * 
- * Supports both SPI and SDMMC modes
- * Default is SPI mode (most compatible)
- */
+ * SD card on VSPI bus
+ * CS=5, MOSI=23, MISO=19, SCK=18
+ ******************************************************************************/
+#ifndef _SDCONFIG_H_
+#define _SDCONFIG_H_
 
-// ============================================
-// SD CARD MODE
-// ============================================
-// Choose one: USE_SPI_MODE or USE_SD_MMC_MODE
-// SPI is more compatible but slower
-// SDMMC is faster but requires specific pin configuration
+// SD card pins
+#define SD_CS_PIN    5
+#define SD_MOSI_PIN  23
+#define SD_MISO_PIN  19
+#define SD_SCK_PIN   18
 
-#define USE_SPI_MODE       // Default - uses VSPI bus
-//#define USE_SD_MMC_MODE  // 1-bit SDMMC mode (uses specific pins)
+// SPI speed
+#define SD_SPI_SPEED 80000000L  // 80MHz
 
-// ============================================
-// SPI MODE PINS (for USE_SPI_MODE)
-// ============================================
-#define SD_CS    5
-#define SD_MISO  19
-#define SD_MOSI  23
-#define SD_SCK   18
+// MJPEG folder on SD card
+#define MJPEG_FOLDER "/mjpeg"
+#define MJPEG_EXTENSION ".mjpeg"
 
-#define SD_SPI_SPEED 80000000L   // 80MHz - works with most cards
+// Maximum files to track
+#define MAX_MJPEG_FILES 20
 
-// ============================================
-// SDMMC MODE PINS (for USE_SD_MMC_MODE)
-// ============================================
-// Default SDMMC pins for ESP32:
-// - DATA0: 2
-// - CMD:   15  
-// - CLK:   14
-// Note: SDMMC uses 1-bit mode by default
-// No additional pins needed (uses built-in defaults)
-
-// ============================================
-// SD CARD SETTINGS
-// ============================================
-#define SD_MOUNT_PATH  "/sd"       // Mount point for SD card
-#define SD_MAX_FILES   50         // Maximum files to list
-#define SD_MAX_FOLDERS 10         // Maximum subfolders to scan
+#endif // _SDCONFIG_H_
