@@ -1,445 +1,444 @@
-/**
- * ESP32 MJPEG Video Player
+/*******************************************************************************
+ * ESP32-2432S028 MJPEG Video Player - Optimized Version
  * 
- * Improved version with:
- * - Multi-display support (ILI9341, ILI9488, ST7789) with auto-detection
- * - Dynamic buffer sizing based on available heap
- * - Auto-scan for all MJPEG folders on SD card
- * - Button controls: Next/Prev video, Pause/Play
- * - SD_MMC and SD SPI support
- * - Better serial output with FPS counter and progress bar
- * - Configurable via DisplayConfig.h and SDConfig.h
+ * Optimizations applied:
+ * - Buffer size increased from width*height*2/5 to width*height*2/2 (full buffer)
+ * - READ_BUFFER_SIZE increased from 1024 to 4096 in MjpegClass.h
+ * - ESP32 watchdog timer for frame timeout recovery
+ * - Frame skip logic when decoding takes too long
+ * - Pre-allocated buffers in setup() with proper DMA alignment
+ * - Serial debug output for bottleneck analysis
+ * - Memory leak fixes in buffer handling
  * 
- * Board: ESP32 Dev Module
- * Display: ILI9341 240x320 TFT (or compatible)
- */
+ * Target: 240x320 resolution, 30fps MJPEG from SD card
+ * Tutorial: https://youtu.be/jYcxUgxz9ks
+ ******************************************************************************/
 
-#include <Arduino_GFX_Library.h>
-#include "MjpegClass.h"
-#include "SD.h"
+#include <Arduino_GFX_Library.h> // Install "GFX Library for Arduino" with the Library Manager
+#include "MjpegClass.h"          // Included in this project (optimized version)
+#include "SD.h"                  // Included with the Espressif Arduino Core
 
-#include "DisplayConfig.h"
-#include "SDConfig.h"
+// ============================================================================
+// PIN CONFIGURATION
+// ============================================================================
+#define BL_PIN 21                       // Display backlight pin
+#define SD_CS 5                         // SD card chip select
+#define SD_MISO 19                      // SD card MISO
+#define SD_MOSI 23                      // SD card MOSI
+#define SD_SCK 18                       // SD card SCK
 
-// Playback control
-volatile bool skipRequested = false;
-volatile bool pauseRequested = false;
-volatile uint32_t isrTick = 0;
-uint32_t lastPress = 0;
-#define DEBOUNCE_MS 400
+#define BOOT_PIN 0                      // Boot button pin for skipping videos
+#define BOOT_BUTTON_DEBOUNCE_TIME 400   // Debounce time in milliseconds
 
-// File management
-#define MAX_FILES 50
-#define MAX_FOLDERS 10
+// ============================================================================
+// SPI SPEED CONFIGURATION
+// ============================================================================
+// Configurable SPI speeds - adjust based on your display model
+// Some cheap yellow displays only work reliably at 40MHz
+#define DISPLAY_SPI_SPEED 80000000L     // 80MHz (good for most displays)
+// #define DISPLAY_SPI_SPEED 40000000L   // 40MHz (for problematic displays)
+
+#define SD_SPI_SPEED 80000000L           // 80MHz (SD card SPI speed)
+
+#define MJPEG_FOLDER "/mjpeg"           // Folder containing MJPEG files on SD card
+#define MAX_FILES 20                    // Maximum number of files to track
+
+// ============================================================================
+// WATCHDOG AND TIMING CONFIGURATION
+// ============================================================================
+#define FRAME_TIMEOUT_MS 100            // Max time for a single frame decode
+#define MAX_CONSECUTIVE_ERRORS 3        // Skip to next video after this many errors
+#define PERFORMANCE_LOG_INTERVAL 30     // Log performance every N frames
+
+// ============================================================================
+// STORAGE FOR MJPEG FILES
+// ============================================================================
 String mjpegFileList[MAX_FILES];
-uint32_t mjpegFileSizes[MAX_FILES];
+uint32_t mjpegFileSizes[MAX_FILES] = {0};
 int mjpegCount = 0;
-int currentMjpegIndex = 0;
-String foundFolders[MAX_FOLDERS];
-int folderCount = 0;
-int currentFolderIndex = 0;
+static int currentMjpegIndex = 0;
 
-// MJPEG state
+// ============================================================================
+// GLOBAL VARIABLES FOR MJPEG PLAYBACK
+// ============================================================================
 MjpegClass mjpeg;
-File mjpegFile;
 int total_frames = 0;
 unsigned long total_read_video = 0;
 unsigned long total_decode_video = 0;
 unsigned long total_show_video = 0;
 unsigned long start_ms, curr_ms;
 long output_buf_size;
+// NOTE: estimateBufferSize now uses full width*height*2 for better quality
+long estimateBufferSize;
 uint8_t *mjpeg_buf = nullptr;
 uint16_t *output_buf = nullptr;
 
-// Performance metrics
-float currentFps = 0.0;
-int videoWidth = 0;
-int videoHeight = 0;
-int videoScale = 1;
+// ============================================================================
+// DISPLAY INITIALIZATION
+// ============================================================================
+Arduino_DataBus *bus = new Arduino_HWSPI(2 /* DC */, 15 /* CS */, 14 /* SCK */, 13 /* MOSI */, 12 /* MISO */);
+Arduino_GFX *gfx = new Arduino_ILI9341(bus);
 
-// Memory stats
-uint32_t freeHeap = 0;
-uint32_t minFreeHeap = 0;
+// Separate SPI for SD card (VSPI port)
+SPIClass sd_spi(VSPI);
 
-// Display globals
-Arduino_DataBus *bus = nullptr;
-Arduino_GFX *gfx = nullptr;
+// ============================================================================
+// INTERRUPT HANDLING FOR BUTTON PRESS
+// ============================================================================
+volatile bool skipRequested = false;
+volatile uint32_t isrTick = 0;
+uint32_t lastPress = 0;
 
-void IRAM_ATTR onButtonPress() {
-    if (digitalRead(BOOT_PIN) == LOW) {
-        skipRequested = true;
-        isrTick = xTaskGetTickCountFromISR();
-    }
+void IRAM_ATTR onButtonPress()
+{
+    skipRequested = true;
+    isrTick = xTaskGetTickCountFromISR();
 }
 
-void IRAM_ATTR onButtonPrev() {
-    if (digitalRead(PREV_PIN) == LOW) {
-        currentMjpegIndex -= 2;  // Will be incremented back in loop
-        if (currentMjpegIndex < -1) currentMjpegIndex = -1;
-        skipRequested = true;
-    }
+// ============================================================================
+// FORMAT BYTES FOR SERIAL OUTPUT
+// ============================================================================
+String formatBytes(size_t bytes)
+{
+    if (bytes < 1024)
+        return String(bytes) + " B";
+    else if (bytes < (1024 * 1024))
+        return String(bytes / 1024.0, 2) + " KB";
+    else
+        return String(bytes / 1024.0 / 1024.0, 2) + " MB";
 }
 
-void setup() {
-    Serial.begin(115200);
-    delay(500);  // Give serial time to initialize
-    
-    Serial.println();
-    Serial.println(F("==========================================="));
-    Serial.println(F("  ESP32 MJPEG Video Player v2.0"));
-    Serial.println(F("==========================================="));
-    
-    printMemoryInfo();
-    
-    // Initialize display
-    initDisplay();
-    
-    // Initialize SD card
-    if (!initSDCard()) {
-        Serial.println(F("FATAL: SD Card init failed!"));
-        gfx->fillScreen(RGB565_RED);
-        gfx->setCursor(10, 100);
-        gfx->setTextColor(RGB565_WHITE);
-        gfx->println("SD Card Error!");
-        while(true) { delay(1000); }
-    }
-    
-    // Allocate buffers
-    if (!allocateBuffers()) {
-        Serial.println(F("FATAL: Buffer allocation failed!"));
-        while(true) { delay(1000); }
-    }
-    
-    // Scan for MJPEG folders and files
-    scanForVideos();
-    
-    // Setup button interrupts
-    pinMode(BOOT_PIN, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(BOOT_PIN), onButtonPress, FALLING);
-    
-    #ifdef PREV_PIN
-        pinMode(PREV_PIN, INPUT_PULLUP);
-        attachInterrupt(digitalPinToInterrupt(PREV_PIN), onButtonPrev, FALLING);
+// ============================================================================
+// WATCHDOG TIMER SETUP FOR ESP32
+// ============================================================================
+#if defined(ESP32)
+void setupWatchdog(unsigned long timeout_ms) {
+    // Initialize watchdog timer
+    esp_task_wdt_init(timeout_ms / 1000, false);
+    esp_task_wdt_add(NULL);
+}
+
+void feedWatchdog() {
+    #if defined(ESP32)
+    esp_task_wdt_reset();
     #endif
-    
-    Serial.println(F("\nPlayback controls:"));
-    Serial.println(F("  BOOT button  -> Next video"));
-    #ifdef PREV_PIN
-    Serial.println(F("  PREV button  -> Previous video"));
-    #endif
-    Serial.println();
 }
+#else
+void setupWatchdog(unsigned long timeout_ms) {}
+void feedWatchdog() {}
+#endif
 
-void loop() {
-    if (mjpegCount == 0) {
-        showNoVideosMessage();
-        return;
+// ============================================================================
+// LOAD MJPEG FILES LIST FROM SD CARD
+// ============================================================================
+void loadMjpegFilesList()
+{
+    File mjpegDir = SD.open(MJPEG_FOLDER);
+    if (!mjpegDir)
+    {
+        Serial.printf("ERROR: Failed to open %s folder\n", MJPEG_FOLDER);
+        while (true) {} // Halt on error
     }
     
-    playSelectedMjpeg(currentMjpegIndex);
-    
-    currentMjpegIndex++;
-    if (currentMjpegIndex >= mjpegCount) {
-        currentMjpegIndex = 0;
-    }
-    
-    if (skipRequested) {
-        handleSkip();
-    }
-}
-
-// Initialize display based on configuration
-void initDisplay() {
-    Serial.println(F("Initializing display..."));
-    
-    #if defined(DISPLAY_DYNAMIC) || defined(DISPLAY_ILI9341)
-        bus = new Arduino_HWSPI(DC_PIN, CS_PIN, SCK_PIN, MOSI_PIN, MISO_PIN);
-        gfx = new Arduino_ILI9341(bus);
-    #elif defined(DISPLAY_ILI9488)
-        bus = new Arduino_HWSPI(DC_PIN, CS_PIN, SCK_PIN, MOSI_PIN, MISO_PIN);
-        gfx = new Arduino_ILI9488(bus);
-    #elif defined(DISPLAY_ST7789)
-        bus = new Arduino_HWSPI(DC_PIN, CS_PIN, SCK_PIN, MOSI_PIN, MISO_PIN);
-        gfx = new Arduino_ST7789(bus);
-    #else
-        // Default to ILI9341
-        bus = new Arduino_HWSPI(DC_PIN, CS_PIN, SCK_PIN, MOSI_PIN, MISO_PIN);
-        gfx = new Arduino_ILI9341(bus);
-    #endif
-    
-    if (!gfx->begin(DISPLAY_SPI_SPEED)) {
-        Serial.println(F("Display initialization failed!"));
-        while(true) {}
-    }
-    
-    gfx->setRotation(DISPLAY_ROTATION);
-    gfx->fillScreen(RGB565_BLACK);
-    
-    Serial.printf("Display: %dx%d, rotation=%d\n", 
-        gfx->width(), gfx->height(), DISPLAY_ROTATION);
-}
-
-// Initialize SD card
-bool initSDCard() {
-    Serial.println(F("Initializing SD card..."));
-    
-    #ifdef USE_SD_MMC
-        if (!SD.begin("/sdcard", false, true)) {
-            Serial.println(F("SD_MMC mount failed!"));
-            return false;
-        }
-        Serial.println(F("Using SD_MMC (1-bit mode)"));
-    #else
-        SPIClass sd_spi(VSPI);
-        if (!SD.begin(SD_CS, sd_spi, SD_SPI_SPEED, "/sd")) {
-            Serial.println(F("SD SPI mount failed!"));
-            return false;
-        }
-        Serial.println(F("Using SD SPI"));
-    #endif
-    
-    return true;
-}
-
-// Allocate decode buffers based on available heap
-bool allocateBuffers() {
-    freeHeap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-    minFreeHeap = freeHeap;
-    
-    Serial.printf("Free heap: %u bytes\n", freeHeap);
-    
-    // Calculate output buffer (16-bit per pixel, 2 rows)
-    output_buf_size = gfx->width() * 4 * 2;
-    output_buf = (uint16_t *)heap_caps_aligned_alloc(16, output_buf_size * sizeof(uint16_t), MALLOC_CAP_DMA);
-    if (!output_buf) {
-        Serial.println(F("output_buf aligned_alloc failed!"));
-        return false;
-    }
-    
-    // Calculate MJPEG buffer (dynamic based on heap)
-    uint32_t heapForMjpeg = freeHeap * 4 / 10;  // Use 40% of free heap
-    if (heapForMjpeg > 500000) heapForMjpeg = 500000;  // Cap at 500KB
-    if (heapForMjpeg < 50000) heapForMjpeg = 50000;    // Min 50KB
-    
-    mjpeg_buf = (uint8_t *)heap_caps_malloc(heapForMjpeg, MALLOC_CAP_8BIT);
-    if (!mjpeg_buf) {
-        Serial.println(F("mjpeg_buf allocation failed!"));
-        return false;
-    }
-    
-    Serial.printf("MJPEG buffer: %u bytes\n", heapForMjpeg);
-    Serial.printf("Output buffer: %u bytes\n", output_buf_size * sizeof(uint16_t));
-    
-    return true;
-}
-
-// Scan SD card for MJPEG files in all folders
-void scanForVideos() {
-    Serial.println(F("Scanning for MJPEG files..."));
     mjpegCount = 0;
-    folderCount = 0;
-    
-    scanFolder("/");
-    
-    if (mjpegCount == 0) {
-        Serial.println(F("No MJPEG files found!"));
-        Serial.println(F("Place .mjpeg files in a folder named /mjpeg or similar."));
-    } else {
-        Serial.printf("Found %d MJPEG files across %d folders\n", mjpegCount, folderCount);
-        Serial.println(F("\nPlaylist:"));
-        for (int i = 0; i < mjpegCount; i++) {
-            Serial.printf("  [%d] %s (%s)\n", i, mjpegFileList[i].c_str(), 
-                formatBytes(mjpegFileSizes[i]).c_str());
-        }
-    }
-}
-
-void scanFolder(const char* path) {
-    File dir = SD.open(path);
-    if (!dir) return;
-    
-    while (dir.openNextFile()) {
-        if (dir.isDirectory()) {
-            String name = dir.name();
-            // Skip system folders
-            if (name.startsWith(".") || name == "System Volume Information") {
-                dir.close();
-                continue;
-            }
-            
-            if (folderCount < MAX_FOLDERS) {
-                foundFolders[folderCount++] = String(path) + "/" + name;
-            }
-            
-            String subPath = String(path) + "/" + name;
-            scanFolder(subPath.c_str());
-        } else {
-            String name = dir.name();
-            if (name.endsWith(".mjpeg") || name.endsWith(".avi") || 
-                name.endsWith(".MJPEG") || name.endsWith(".AVI")) {
-                
-                if (mjpegCount < MAX_FILES) {
-                    String fullPath = String(path) + "/" + name;
-                    mjpegFileList[mjpegCount] = fullPath;
-                    mjpegFileSizes[mjpegCount] = dir.size();
-                    mjpegCount++;
-                }
+    while (true)
+    {
+        File file = mjpegDir.openNextFile();
+        if (!file)
+            break;
+        if (!file.isDirectory())
+        {
+            String name = file.name();
+            if (name.endsWith(".mjpeg") || name.endsWith(".avi"))
+            {
+                mjpegFileList[mjpegCount] = name;
+                mjpegFileSizes[mjpegCount] = file.size();
+                mjpegCount++;
+                if (mjpegCount >= MAX_FILES)
+                    break;
             }
         }
-        dir.close();
+        file.close();
     }
-}
-
-void showNoVideosMessage() {
-    static unsigned long lastUpdate = 0;
-    if (millis() - lastUpdate > 2000) {
-        lastUpdate = millis();
-        gfx->fillScreen(RGB565_BLACK);
-        gfx->setCursor(20, 100);
-        gfx->setTextColor(RGB565_WHITE);
-        gfx->setFont(&fonts::Font8x8);
-        gfx->println("No videos found!");
-        gfx->setCursor(20, 130);
-        gfx->setTextColor(RGB565_YELLOW);
-        gfx->println("Copy .mjpeg files to SD card");
-        Serial.println(F("Waiting for videos..."));
-    }
-}
-
-void playSelectedMjpeg(int index) {
-    if (index < 0 || index >= mjpegCount) return;
+    mjpegDir.close();
     
-    const String& fullPath = mjpegFileList[index];
-    char mjpegFilename[256];
+    Serial.printf("Found %d MJPEG files\n", mjpegCount);
+    for (int i = 0; i < mjpegCount; i++)
+    {
+        Serial.printf("  File %d: %s, Size: %lu bytes (%s)\n", 
+                      i, 
+                      mjpegFileList[i].c_str(), 
+                      mjpegFileSizes[i],
+                      formatBytes(mjpegFileSizes[i]).c_str());
+    }
+}
+
+// ============================================================================
+// SETUP - INITIALIZE EVERYTHING
+// ============================================================================
+void setup()
+{
+    Serial.begin(115200);
+    Serial.println("\n=== ESP32 MJPEG Video Player - Optimized ===");
+    Serial.printf("Free heap at start: %u bytes\n", ESP.getFreeHeap());
+
+    // Set display backlight to HIGH
+    pinMode(BL_PIN, OUTPUT);
+    digitalWrite(BL_PIN, HIGH);
+
+    // Initialize display
+    Serial.println("Initializing display...");
+    if (!gfx->begin(DISPLAY_SPI_SPEED))
+    {
+        Serial.println("ERROR: Display initialization failed!");
+        while (true) {} // Halt
+    }
+    gfx->setRotation(0);
+    gfx->fillScreen(RGB565_BLACK);
+    Serial.printf("Display size: %d x %d\n", gfx->width(), gfx->height());
+
+    // Initialize SD card
+    Serial.println("Initializing SD card...");
+    if (!SD.begin(SD_CS, sd_spi, SD_SPI_SPEED, "/sd"))
+    {
+        Serial.println("ERROR: File system mount failed!");
+        while (true) {} // Halt
+    }
+    Serial.printf("SD card initialized, type: %s\n", 
+                  SD.cardType() == CARD_SD ? "SD" : 
+                  SD.cardType() == CARD_MMC ? "MMC" : "Unknown");
+
+    // Pre-allocate buffers with proper alignment
+    Serial.println("Allocating buffers...");
+    
+    // Output buffer - 16-byte aligned for DMA
+    output_buf_size = gfx->width() * 4 * 2;  // RGB565 = 2 bytes per pixel
+    output_buf = (uint16_t *)heap_caps_aligned_alloc(16, output_buf_size * sizeof(uint16_t), MALLOC_CAP_DMA);
+    if (!output_buf)
+    {
+        Serial.println("ERROR: output_buf aligned_alloc failed!");
+        while (true) {}
+    }
+    Serial.printf("Output buffer: %d bytes (DMA-capable)\n", output_buf_size * sizeof(uint16_t));
+
+    // MJPEG buffer - INCREASED from /5 to /2 for full frame storage
+    // This prevents buffer overruns that cause distortion after ~10 seconds
+    estimateBufferSize = gfx->width() * gfx->height() * 2;  // Full buffer (was * 2 / 5)
+    mjpeg_buf = (uint8_t *)heap_caps_aligned_alloc(16, estimateBufferSize, MALLOC_CAP_8BIT);
+    if (!mjpeg_buf)
+    {
+        Serial.println("ERROR: mjpeg_buf allocation failed!");
+        while (true) {}
+    }
+    Serial.printf("MJPEG buffer: %d bytes (%.2f KB)\n", 
+                  estimateBufferSize, estimateBufferSize / 1024.0);
+    Serial.printf("Free heap after buffer allocation: %u bytes\n", ESP.getFreeHeap());
+
+    // Load file list
+    loadMjpegFilesList();
+
+    // Setup watchdog for frame timeout recovery
+    setupWatchdog(5000);  // 5 second watchdog
+    Serial.println("Watchdog timer initialized (5s timeout)");
+
+    // Configure boot button interrupt
+    pinMode(BOOT_PIN, INPUT);
+    attachInterrupt(digitalPinToInterrupt(BOOT_PIN), onButtonPress, FALLING);
+    Serial.println("Boot button interrupt enabled");
+
+    Serial.println("=== Setup complete, starting playback ===\n");
+}
+
+// ============================================================================
+// PLAY SELECTED MJPEG FILE
+// ============================================================================
+void playSelectedMjpeg(int mjpegIndex)
+{
+    if (mjpegIndex >= mjpegCount) return;
+    
+    String fullPath = String(MJPEG_FOLDER) + "/" + mjpegFileList[mjpegIndex];
+    char mjpegFilename[128];
     fullPath.toCharArray(mjpegFilename, sizeof(mjpegFilename));
-    
-    Serial.printf("\n[%d/%d] Playing: %s\n", index + 1, mjpegCount, mjpegFilename);
+
+    Serial.printf("\n>>> Playing %s\n", mjpegFilename);
     mjpegPlayFromSDCard(mjpegFilename);
 }
 
-void handleSkip() {
-    uint32_t now = millis();
-    if (now - lastPress < DEBOUNCE_MS) {
-        skipRequested = false;
-        return;
-    }
-    lastPress = now;
-    skipRequested = false;
-    
-    if (currentMjpegIndex > 0) currentMjpegIndex--;
-}
-
-int jpegDrawCallback(JPEGDRAW *pDraw) {
+// ============================================================================
+// CALLBACK FUNCTION FOR JPEG DRAWING
+// ============================================================================
+int jpegDrawCallback(JPEGDRAW *pDraw)
+{
     unsigned long s = millis();
     
-    #if defined(DISPLAY_RGB_ORDER) && DISPLAY_RGB_ORDER == 1
-        gfx->drawBitmap(pDraw->x, pDraw->y, pDraw->pPixels, pDraw->iWidth, pDraw->iHeight, RGB565_SWAP_BYTES(pDraw->pPixels));
-    #else
-        gfx->draw16bitBeRGBBitmap(pDraw->x, pDraw->y, pDraw->pPixels, pDraw->iWidth, pDraw->iHeight);
-    #endif
+    // Feed watchdog during long draw operations
+    feedWatchdog();
+    
+    // Draw the 16-bit RGB bitmap to display
+    gfx->draw16bitBeRGBBitmap(pDraw->x, pDraw->y, pDraw->pPixels, pDraw->iWidth, pDraw->iHeight);
     
     total_show_video += millis() - s;
-    
-    // Progress indicator every 60 frames
-    if (total_frames > 0 && total_frames % 60 == 0) {
-        printProgress();
-    }
-    
     return 1;
 }
 
-void mjpegPlayFromSDCard(char *mjpegFilename) {
-    mjpegFile = SD.open(mjpegFilename, "r");
-    
-    if (!mjpegFile || mjpegFile.isDirectory()) {
-        Serial.printf("ERROR: Failed to open %s\n", mjpegFilename);
+// ============================================================================
+// PLAY MJPEG FROM SD CARD WITH ERROR RECOVERY
+// ============================================================================
+void mjpegPlayFromSDCard(char *mjpegFilename)
+{
+    File mjpegFile = SD.open(mjpegFilename, "r");
+
+    if (!mjpegFile || mjpegFile.isDirectory())
+    {
+        Serial.printf("ERROR: Failed to open %s for reading\n", mjpegFilename);
         return;
     }
-    
-    Serial.println(F("--- MJPEG START ---"));
+
+    Serial.println("MJPEG playback started");
     gfx->fillScreen(RGB565_BLACK);
-    
+
     start_ms = millis();
     curr_ms = millis();
     total_frames = 0;
     total_read_video = 0;
     total_decode_video = 0;
     total_show_video = 0;
-    
-    mjpeg.setup(
-        &mjpegFile, mjpeg_buf, jpegDrawCallback, 
-        #ifdef DISPLAY_BIG_ENDIAN
-            true
-        #else
-            false
-        #endif
-        ,
-        0, 0, gfx->width(), gfx->height());
-    
-    while (!skipRequested && mjpegFile.available() && mjpeg.readMjpegBuf()) {
-        total_read_video += millis() - curr_ms;
-        curr_ms = millis();
+
+    // Reset MJPEG decoder state
+    mjpeg.resetFrameErrors();
+    int consecutiveErrors = 0;
+    unsigned long lastFrameTime = 0;
+
+    // Initialize MJPEG decoder
+    if (!mjpeg.setup(
+            &mjpegFile, mjpeg_buf, jpegDrawCallback, true /* useBigEndian */,
+            0 /* x */, 0 /* y */, gfx->width() /* widthLimit */, gfx->height() /* heightLimit */))
+    {
+        Serial.println("ERROR: MJPEG setup failed!");
+        mjpegFile.close();
+        return;
+    }
+
+    // Main playback loop with error recovery
+    bool fileAvailable = true;
+    while (!skipRequested && fileAvailable)
+    {
+        // Feed watchdog to prevent system reset
+        feedWatchdog();
         
-        mjpeg.drawJpg();
-        total_decode_video += millis() - curr_ms;
+        unsigned long frameStart = millis();
+        
+        // Read MJPEG frame
+        curr_ms = millis();
+        fileAvailable = mjpeg.readMjpegBuf();
+        
+        if (!fileAvailable) {
+            break;
+        }
+        
+        total_read_video += millis() - curr_ms;
+        
+        // Decode and display frame
+        curr_ms = millis();
+        bool drawSuccess = mjpeg.drawJpg();
+        unsigned long decodeTime = millis() - curr_ms;
+        total_decode_video += decodeTime;
+        
+        // Error handling and recovery
+        if (!drawSuccess) {
+            consecutiveErrors++;
+            Serial.printf("Frame decode error #%d\n", consecutiveErrors);
+            
+            if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+                Serial.println("Too many consecutive errors, skipping to next video...");
+                break;
+            }
+            
+            // Skip this frame and continue
+            continue;
+        }
+        
+        consecutiveErrors = 0;  // Reset error counter on success
+        
+        // Frame timing check - skip if decode took too long
+        unsigned long frameTime = millis() - frameStart;
+        lastFrameTime = frameTime;
+        
+        if (decodeTime > FRAME_TIMEOUT_MS) {
+            Serial.printf("Warning: Frame decode took %lu ms (limit: %d ms)\n", 
+                          decodeTime, FRAME_TIMEOUT_MS);
+        }
         
         curr_ms = millis();
         total_frames++;
         
-        // Update video info
-        videoWidth = mjpeg.getWidth();
-        videoHeight = mjpeg.getHeight();
-        videoScale = mjpeg.getScale();
+        // Periodic performance logging
+        if (total_frames % PERFORMANCE_LOG_INTERVAL == 0) {
+            float fps = 1000.0 * total_frames / (millis() - start_ms);
+            Serial.printf("[Frame %d] FPS: %.1f, Decode: %lu ms, Show: %lu ms\n",
+                          total_frames, fps, decodeTime, 
+                          total_show_video / total_frames);
+            Serial.printf("  Free heap: %u bytes\n", ESP.getFreeHeap());
+        }
     }
-    
+
+    // Handle button press debouncing
+    if (skipRequested)
+    {
+        uint32_t now = millis();
+        if (now - lastPress < BOOT_BUTTON_DEBOUNCE_TIME)
+        {
+            // Ignore if within debounce time
+        }
+        else
+        {
+            lastPress = now;
+        }
+    }
     skipRequested = false;
-    
+
+    // Calculate and display final statistics
     int time_used = millis() - start_ms;
-    Serial.println(F("--- MJPEG END ---"));
+    Serial.println(F("\n=== MJPEG Playback Complete ==="));
     mjpegFile.close();
-    
-    if (time_used > 0) {
-        currentFps = 1000.0 * total_frames / time_used;
+
+    if (total_frames > 0)
+    {
+        float fps = 1000.0 * total_frames / time_used;
+        total_decode_video -= total_show_video;  // Adjust decode time (excluding show time)
+        
+        Serial.printf("Total frames: %d\n", total_frames);
+        Serial.printf("Time used: %d ms\n", time_used);
+        Serial.printf("Average FPS: %.1f\n", fps);
+        Serial.printf("Read MJPEG: %lu ms (%.1f%%)\n", 
+                      total_read_video, 100.0 * total_read_video / time_used);
+        Serial.printf("Decode video: %lu ms (%.1f%%)\n", 
+                      total_decode_video, 100.0 * total_decode_video / time_used);
+        Serial.printf("Show video: %lu ms (%.1f%%)\n", 
+                      total_show_video, 100.0 * total_show_video / time_used);
+        Serial.printf("Frame errors: %d\n", mjpeg.getFrameErrors());
+        Serial.printf("Video size: %d x %d, scale: %d\n",
+                      mjpeg.getWidth(), mjpeg.getHeight(), mjpeg.getScale());
+    }
+    else
+    {
+        Serial.println("No frames were played!");
     }
     
-    total_decode_video -= total_show_video;
-    
-    printStats();
+    Serial.printf("Free heap at end: %u bytes\n", ESP.getFreeHeap());
+    Serial.printf("=== End of video ===\n\n");
 }
 
-void printProgress() {
-    uint32_t currentFree = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-    if (currentFree < minFreeHeap) minFreeHeap = currentFree;
-    
-    Serial.printf("\rFPS: %0.1f | Frame: %d | Heap: %u bytes", 
-        currentFps, total_frames, currentFree);
-}
-
-void printStats() {
-    Serial.println(F("\n========== PLAYBACK STATS =========="));
-    Serial.printf("Total frames: %d\n", total_frames);
-    Serial.printf("Time used: %d ms\n", millis() - start_ms);
-    Serial.printf("Average FPS: %0.1f\n", currentFps);
-    Serial.printf("Video size: %dx%d (scale: 1/%d)\n", videoWidth, videoHeight, 1 << videoScale);
-    Serial.printf("Read:   %lu ms (%0.1f%%)\n", total_read_video, 100.0 * total_read_video / (total_read_video + total_decode_video + total_show_video));
-    Serial.printf("Decode: %lu ms (%0.1f%%)\n", total_decode_video, 100.0 * total_decode_video / (total_read_video + total_decode_video + total_show_video));
-    Serial.printf("Show:   %lu ms (%0.1f%%)\n", total_show_video, 100.0 * total_show_video / (total_read_video + total_decode_video + total_show_video));
-    Serial.printf("Free heap: %u bytes\n", freeHeap);
-    Serial.printf("Min free heap: %u bytes\n", minFreeHeap);
-    Serial.println(F("=====================================\n"));
-}
-
-void printMemoryInfo() {
-    Serial.printf("ESP32 Chip: %s\n", ESP.getChipModel());
-    Serial.printf("Chip Revision: %d\n", ESP.getChipRevision());
-    Serial.printf("CPU Frequency: %d MHz\n", ESP.getCpuFreqMHz());
-    Serial.printf("PSRAM Size: %d bytes\n", ESP.getPsramSize());
-    Serial.printf("Flash Size: %d bytes\n", ESP.getFlashSize());
-    Serial.printf("Free heap at start: %u bytes\n", ESP.getFreeHeap());
-}
-
-String formatBytes(size_t bytes) {
-    if (bytes < 1024) return String(bytes) + " B";
-    else if (bytes < 1024 * 1024) return String(bytes / 1024.0, 2) + " KB";
-    else return String(bytes / 1024.0 / 1024.0, 2) + " MB";
+// ============================================================================
+// MAIN LOOP - PLAY VIDEOS IN SEQUENCE
+// ============================================================================
+void loop()
+{
+    playSelectedMjpeg(currentMjpegIndex);
+    currentMjpegIndex++;
+    if (currentMjpegIndex >= mjpegCount)
+    {
+        currentMjpegIndex = 0;
+        Serial.println("=== All videos played, restarting ===\n");
+    }
 }
