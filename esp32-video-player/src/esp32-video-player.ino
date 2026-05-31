@@ -253,7 +253,7 @@ void loadFileList() {
     if (!f) break;
     
     String name = f.name();
-    if (name.endsWith(".mjpeg") || name.endsWith(".avi") || name.endsWith(".jpg")) {
+    if (name.endsWith(".mjpeg")) {
       mjpegFiles[mjpegCount] = name;
       mjpegCount++;
       if (mjpegCount >= MAX_MJPEG_FILES) break;
@@ -545,27 +545,66 @@ void setup() {
   Serial.println("WiFi/BT disabled");
   
   // Initialize SD card
-  Serial.println("Initializing SD card...");
+  // FIRST: Initialize display so we can show messages
+  Serial.println("Initializing display...");
+  if (!initDisplay()) {
+    Serial.println("Display init FAILED!");
+    while (1) delay(100);
+  }
+  
+  // Show startup message on screen
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.println("=== MJPEG Player ===");
+  tft.setTextSize(1);
+  tft.println("");
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.println("Iniciando...");
+  
+  // Disable WiFi and Bluetooth for clean SPI
+  WiFi.mode(WIFI_OFF);
+  btStop();
+  tft.println("WiFi/BT off");
+  
+  // Initialize SD card
+  tft.print("SD card init... ");
+  
   SPIClass sdSPI(VSPI);
   sdSPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
   
   if (!SD.begin(SD_CS_PIN, sdSPI, SD_SPI_SPEED, "/sd")) {
-    Serial.println("SD card init FAILED!");
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.println("FALLO!");
+    tft.println("");
+    tft.println("INSERTA LA SD");
+    tft.println("y reinicia");
     while (1) delay(100);
   }
-  Serial.println("SD card initialized");
+  
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.println("OK");
   
   // Initialize audio DAC on GPIO 25
   audioPlayer.begin();
-  Serial.println("Audio system initialized");
+  tft.println("Audio OK");
   
   // Load file list
+  tft.print("Buscando videos... ");
   loadFileList();
+  
   if (mjpegCount == 0) {
-    Serial.println("ERROR: No video files found!");
-    Serial.println("Create folder /mjpeg on SD card and add .mjpeg files");
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.println("SIN VIDEOS");
+    tft.println("");
+    tft.println("Crea carpeta:");
+    tft.println("/mjpeg");
+    tft.println("y agrega .mjpeg");
     while (1) delay(100);
   }
+  
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.printf("OK (%d videos)\n", mjpegCount);
   
   // Allocate buffers
 #ifdef BOARD_HAS_PSRAM
@@ -573,29 +612,20 @@ void setup() {
   frameBuf1 = (uint8_t*)heap_caps_aligned_alloc(16, FRAME_BUFFER_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
   
   if (!frameBuf0 || !frameBuf1) {
-    Serial.println("PSRAM buffer allocation failed!");
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.println("Mem error!");
     while (1) delay(100);
   }
-  Serial.printf("Buffers allocated in PSRAM: %p, %p\n", frameBuf0, frameBuf1);
 #else
-  Serial.println("Using internal RAM buffers");
 #endif
-  
-  // Initialize display
-  if (!initDisplay()) {
-    Serial.println("Display init FAILED!");
-    while (1) delay(100);
-  }
-  
-  // Fill screen black
-  displayFrameDMA((uint16_t*)frameBuf0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
   
   // Create semaphores
   frameReadySem = xSemaphoreCreateBinary();
   frameDisplaySem = xSemaphoreCreateBinary();
   
   if (!frameReadySem || !frameDisplaySem) {
-    Serial.println("Semaphore creation failed!");
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.println("Sem error!");
     while (1) delay(100);
   }
   
@@ -605,6 +635,15 @@ void setup() {
   // Button interrupt
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
   attachInterrupt(BOOT_BUTTON_PIN, buttonISR, FALLING);
+  
+  // Show "PLAYING" message briefly
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.println("REPRODUCIENDO");
+  tft.setTextSize(1);
+  delay(1000);
+  tft.fillScreen(TFT_BLACK);
   
   // Create decoder task on Core 0
   xTaskCreatePinnedToCore(
